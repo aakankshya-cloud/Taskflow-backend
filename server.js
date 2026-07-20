@@ -1,10 +1,12 @@
 const express = require('express');
 const cors = require('cors');
 const http = require('http');
+const jwt = require('jsonwebtoken');
 const { Server } = require('socket.io');
 require('dotenv').config();
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const db = require('./config/db');
 const authRoutes = require('./routes/authRoutes');
 const workspaceRoutes = require('./routes/workspaceRoutes');
 const projectRoutes = require('./routes/projectRoutes');
@@ -13,19 +15,20 @@ const taskRoutes = require('./routes/taskRoutes');
 const app = express();
 const server = http.createServer(app);
 
-const io = new Server(server, {
-  cors: {
-    origin: 'http://localhost:5173',
-    methods: ['GET', 'POST', 'PUT', 'DELETE']
-  }
-});
+// SECURITY FIX: app.use(cors()) with no options reflects and allows
+// EVERY origin. Lock it down to the actual frontend URL(s).
+const allowedOrigins = (process.env.FRONTEND_URL || 'http://localhost:5173').split(',');
+const corsOptions = {
+  origin: allowedOrigins,
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+};
 
-app.use(cors());
+const io = new Server(server, { cors: corsOptions });
+
+app.use(cors(corsOptions));
 app.use(express.json());
-// Security headers
 app.use(helmet());
 
-// Rate limiting — 100 requests per 15 minutes per IP
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100,
@@ -33,7 +36,6 @@ const limiter = rateLimit({
 });
 app.use('/api/', limiter);
 
-// Stricter limit on auth routes — 10 attempts per 15 minutes
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
@@ -41,19 +43,42 @@ const authLimiter = rateLimit({
 });
 app.use('/api/auth/', authLimiter);
 
-// Attach io to every request so controllers can emit events
 app.use((req, res, next) => {
   req.io = io;
   next();
 });
 
+// SECURITY FIX: sockets used to accept ANY workspaceId in join:workspace
+// with zero authentication, so anyone could listen to any workspace's
+// live task feed. Now a socket must present a valid JWT to connect, and
+// we verify DB membership before letting it join a workspace room.
+io.use((socket, next) => {
+  try {
+    const token = socket.handshake.auth?.token;
+    if (!token) return next(new Error('Unauthorized'));
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    socket.userId = decoded.id;
+    next();
+  } catch {
+    next(new Error('Unauthorized'));
+  }
+});
+
 io.on('connection', (socket) => {
   console.log('User connected:', socket.id);
 
-  // User joins their workspace room
-  socket.on('join:workspace', (workspaceId) => {
-    socket.join(`workspace:${workspaceId}`);
-    console.log(`Socket ${socket.id} joined workspace:${workspaceId}`);
+  socket.on('join:workspace', async (workspaceId) => {
+    try {
+      const [rows] = await db.query(
+        'SELECT 1 FROM workspace_members WHERE workspace_id = ? AND user_id = ?',
+        [workspaceId, socket.userId]
+      );
+      if (rows.length === 0) return; // silently ignore — not a member
+      socket.join(`workspace:${workspaceId}`);
+      console.log(`Socket ${socket.id} joined workspace:${workspaceId}`);
+    } catch (err) {
+      console.error(err);
+    }
   });
 
   socket.on('disconnect', () => {

@@ -1,4 +1,6 @@
+const crypto = require('crypto');
 const db = require('../config/db');
+const { ROLE_RANK } = require('../middleware/authorize');
 
 exports.createWorkspace = async (req, res) => {
   try {
@@ -38,18 +40,28 @@ exports.getWorkspaces = async (req, res) => {
   }
 };
 
+// NOTE: this handler now runs behind requireWorkspaceRole('id', 'manager')
+// (see routes/workspaceRoutes.js), so req.membershipRole is guaranteed set
+// and the caller is guaranteed to be a manager or admin of :id.
 exports.inviteMember = async (req, res) => {
   try {
     const { email, role } = req.body;
     const workspaceId = req.params.id;
+    const requestedRole = role || 'member';
 
-    // Generate a random invite code like 8F92-KD01
-    const code = Math.random().toString(36).substring(2, 6).toUpperCase() +
-      '-' + Math.random().toString(36).substring(2, 6).toUpperCase();
+    // A manager can invite members/managers but not admins — only an
+    // admin can grant admin. Prevents privilege escalation.
+    if (ROLE_RANK[requestedRole] > ROLE_RANK[req.membershipRole]) {
+      return res.status(403).json({ message: 'You cannot invite someone with a higher role than your own' });
+    }
+
+    // crypto.randomBytes instead of Math.random(): Math.random() is not
+    // cryptographically secure and invite codes should not be guessable.
+    const code = crypto.randomBytes(4).toString('hex').toUpperCase().match(/.{1,4}/g).join('-');
 
     await db.query(
       'INSERT INTO invite_codes (code, workspace_id, role, email) VALUES (?, ?, ?, ?)',
-      [code, workspaceId, role || 'member', email || null]
+      [code, workspaceId, requestedRole, email || null]
     );
 
     res.json({ message: 'Invite code generated', code });
@@ -61,9 +73,13 @@ exports.inviteMember = async (req, res) => {
 
 exports.joinWithCode = async (req, res) => {
   try {
-    const { code, userId } = req.body;
+    const { code } = req.body;
+    // SECURITY FIX: the old version trusted `userId` from the request
+    // body, meaning any authenticated user could add ANY other user id
+    // to a workspace just by guessing/enumerating ids. The user being
+    // added must always be the authenticated caller.
+    const userId = req.user.id;
 
-    // Find the invite code
     const [codes] = await db.query(
       'SELECT * FROM invite_codes WHERE code = ? AND used = 0',
       [code]
@@ -75,7 +91,11 @@ exports.joinWithCode = async (req, res) => {
 
     const invite = codes[0];
 
-    // Check if user is already a member
+    // If the invite was issued for a specific email, enforce it.
+    if (invite.email && invite.email.toLowerCase() !== (req.user.email || '').toLowerCase()) {
+      return res.status(403).json({ message: 'This invite code is not for your account' });
+    }
+
     const [existing] = await db.query(
       'SELECT id FROM workspace_members WHERE workspace_id = ? AND user_id = ?',
       [invite.workspace_id, userId]
@@ -85,13 +105,11 @@ exports.joinWithCode = async (req, res) => {
       return res.status(400).json({ message: 'Already a member of this workspace' });
     }
 
-    // Add user to workspace
     await db.query(
       'INSERT INTO workspace_members (workspace_id, user_id, role) VALUES (?, ?, ?)',
       [invite.workspace_id, userId, invite.role]
     );
 
-    // Mark code as used
     await db.query('UPDATE invite_codes SET used = 1 WHERE id = ?', [invite.id]);
 
     res.json({ message: 'Joined workspace successfully' });
@@ -100,6 +118,8 @@ exports.joinWithCode = async (req, res) => {
     res.status(500).json({ message: 'Server error' });
   }
 };
+
+// Behind requireWorkspaceRole('id', 'member')
 exports.getMembers = async (req, res) => {
   try {
     const [members] = await db.query(
@@ -115,10 +135,12 @@ exports.getMembers = async (req, res) => {
     res.status(500).json({ message: 'Server error' });
   }
 };
+
+// Behind requireWorkspaceRole('id', 'member')
 exports.getAuditLogs = async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
+    const limit = Math.min(parseInt(req.query.limit) || 20, 100); // cap page size
     const offset = (page - 1) * limit;
 
     const [logs] = await db.query(
@@ -138,42 +160,32 @@ exports.getAuditLogs = async (req, res) => {
 
     res.json({
       logs,
-      pagination: {
-        page,
-        limit,
-        total,
-        totalPages: Math.ceil(total / limit)
-      }
+      pagination: { page, limit, total, totalPages: Math.ceil(total / limit) }
     });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error' });
   }
 };
-// Workload balancer: scores each member's current open workload as
-// sum(priority_weight x urgency_weight) across their open (non-done) tasks,
-// and returns the lowest-scoring member as the suggested assignee for a new task.
+
 const PRIORITY_WEIGHT = { low: 1, medium: 2, high: 3 };
 
 function scoreForTask(task) {
   const priorityWeight = PRIORITY_WEIGHT[task.priority] || PRIORITY_WEIGHT.medium;
-
-  // Urgency: overdue tasks weigh most, then tasks due soon, then everything else.
   let urgencyWeight = 1;
   if (task.deadline) {
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const due = new Date(task.deadline);
     const daysUntilDue = Math.ceil((due - today) / (1000 * 60 * 60 * 24));
-
-    if (daysUntilDue < 0) urgencyWeight = 3; // overdue
-    else if (daysUntilDue <= 3) urgencyWeight = 2; // due soon
+    if (daysUntilDue < 0) urgencyWeight = 3;
+    else if (daysUntilDue <= 3) urgencyWeight = 2;
     else urgencyWeight = 1;
   }
-
   return priorityWeight * urgencyWeight;
 }
 
+// Behind requireWorkspaceRole('id', 'member')
 exports.getWorkload = async (req, res) => {
   try {
     const workspaceId = req.params.id;
@@ -195,25 +207,15 @@ exports.getWorkload = async (req, res) => {
     );
 
     const workload = members.map((member) => {
-      const memberTasks = openTasks.filter(
-        (t) => String(t.assignee_id) === String(member.id)
-      );
+      const memberTasks = openTasks.filter((t) => String(t.assignee_id) === String(member.id));
       const score = memberTasks.reduce((sum, t) => sum + scoreForTask(t), 0);
-
-      return {
-        id: member.id,
-        name: member.name,
-        email: member.email,
-        openTasks: memberTasks.length,
-        score,
-      };
+      return { id: member.id, name: member.name, email: member.email, openTasks: memberTasks.length, score };
     });
 
     workload.sort((a, b) => a.score - b.score);
 
     res.json({
       members: workload,
-      // Lightest-weighted member gets the nod; ties broken by whoever has fewer open tasks.
       suggestedAssigneeId: workload.length > 0 ? workload[0].id : null,
     });
   } catch (err) {
@@ -222,6 +224,7 @@ exports.getWorkload = async (req, res) => {
   }
 };
 
+// Behind requireWorkspaceRole('id', 'member')
 exports.getAnalytics = async (req, res) => {
   try {
     const workspaceId = req.params.id;
@@ -261,11 +264,7 @@ exports.getAnalytics = async (req, res) => {
       [workspaceId]
     );
 
-    res.json({
-      stats: totalResult[0],
-      tasksPerMember,
-      burndown
-    });
+    res.json({ stats: totalResult[0], tasksPerMember, burndown });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error' });

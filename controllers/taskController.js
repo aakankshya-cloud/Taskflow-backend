@@ -1,9 +1,25 @@
 const db = require('../config/db');
+const { getMembership, getWorkspaceIdForProject, getWorkspaceIdForTask, ROLE_RANK } = require('../middleware/authorize');
 
 exports.createTask = async (req, res) => {
   try {
     const { name, description, project_id, assignee_id, priority, deadline } = req.body;
     if (!name || !project_id) return res.status(400).json({ message: 'Name and project required' });
+
+    const workspaceId = await getWorkspaceIdForProject(project_id);
+    if (!workspaceId) return res.status(404).json({ message: 'Project not found' });
+
+    // SECURITY FIX: must be a member of the project's workspace to create
+    // a task in it.
+    const role = await getMembership(workspaceId, req.user.id);
+    if (!role) return res.status(403).json({ message: 'You are not a member of this workspace' });
+
+    // If an assignee is given, they must also belong to the workspace —
+    // otherwise you could assign tasks to arbitrary user ids.
+    if (assignee_id) {
+      const assigneeRole = await getMembership(workspaceId, assignee_id);
+      if (!assigneeRole) return res.status(400).json({ message: 'Assignee is not a member of this workspace' });
+    }
 
     const [result] = await db.query(
       `INSERT INTO tasks (name, description, project_id, assignee_id, priority, deadline, created_by)
@@ -11,13 +27,9 @@ exports.createTask = async (req, res) => {
       [name, description || null, project_id, assignee_id || null, priority || 'medium', deadline || null, req.user.id]
     );
 
-    const [workspace] = await db.query(
-      'SELECT workspace_id FROM projects WHERE id = ?', [project_id]
-    );
-
     await db.query(
       'INSERT INTO audit_logs (workspace_id, user_id, task_id, action) VALUES (?, ?, ?, ?)',
-      [workspace[0].workspace_id, req.user.id, result.insertId, `Created task "${name}"`]
+      [workspaceId, req.user.id, result.insertId, `Created task "${name}"`]
     );
 
     const newTask = {
@@ -32,7 +44,7 @@ exports.createTask = async (req, res) => {
       created_by: req.user.id
     };
 
-    req.io.to(`workspace:${workspace[0].workspace_id}`).emit('task:created', newTask);
+    req.io.to(`workspace:${workspaceId}`).emit('task:created', newTask);
 
     res.status(201).json({ message: 'Task created', id: result.insertId });
   } catch (err) {
@@ -43,8 +55,16 @@ exports.createTask = async (req, res) => {
 
 exports.getTasks = async (req, res) => {
   try {
+    const projectId = req.params.projectId;
+
+    const workspaceId = await getWorkspaceIdForProject(projectId);
+    if (!workspaceId) return res.status(404).json({ message: 'Project not found' });
+
+    const role = await getMembership(workspaceId, req.user.id);
+    if (!role) return res.status(403).json({ message: 'You are not a member of this workspace' });
+
     const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 50;
+    const limit = Math.min(parseInt(req.query.limit) || 50, 100);
     const offset = (page - 1) * limit;
 
     const [tasks] = await db.query(
@@ -53,12 +73,12 @@ exports.getTasks = async (req, res) => {
        LEFT JOIN users u ON t.assignee_id = u.id
        WHERE t.project_id = ?
        LIMIT ? OFFSET ?`,
-      [req.params.projectId, limit, offset]
+      [projectId, limit, offset]
     );
 
     const [[{ total }]] = await db.query(
       'SELECT COUNT(*) as total FROM tasks WHERE project_id = ?',
-      [req.params.projectId]
+      [projectId]
     );
 
     res.json({ tasks, pagination: { page, limit, total, totalPages: Math.ceil(total / limit) } });
@@ -76,6 +96,15 @@ exports.updateTask = async (req, res) => {
     const [task] = await db.query('SELECT * FROM tasks WHERE id = ?', [taskId]);
     if (task.length === 0) return res.status(404).json({ message: 'Task not found' });
 
+    const workspaceId = await getWorkspaceIdForTask(taskId);
+    const role = await getMembership(workspaceId, req.user.id);
+    if (!role) return res.status(403).json({ message: 'You are not a member of this workspace' });
+
+    if (assignee_id) {
+      const assigneeRole = await getMembership(workspaceId, assignee_id);
+      if (!assigneeRole) return res.status(400).json({ message: 'Assignee is not a member of this workspace' });
+    }
+
     await db.query(
       `UPDATE tasks SET 
         name = COALESCE(?, name),
@@ -87,16 +116,12 @@ exports.updateTask = async (req, res) => {
       [name || null, description || null, priority || null, deadline || null, assignee_id ?? task[0].assignee_id, taskId]
     );
 
-    const [workspace] = await db.query(
-      'SELECT workspace_id FROM projects WHERE id = ?', [task[0].project_id]
-    );
-
     await db.query(
       'INSERT INTO audit_logs (workspace_id, user_id, task_id, action) VALUES (?, ?, ?, ?)',
-      [workspace[0].workspace_id, req.user.id, taskId, `Updated task "${name || task[0].name}"`]
+      [workspaceId, req.user.id, taskId, `Updated task "${name || task[0].name}"`]
     );
 
-    req.io.to(`workspace:${workspace[0].workspace_id}`).emit('task:updated', {
+    req.io.to(`workspace:${workspaceId}`).emit('task:updated', {
       id: parseInt(taskId),
       name: name || task[0].name,
       description: description || task[0].description,
@@ -130,21 +155,18 @@ exports.updateTaskStatus = async (req, res) => {
     const [task] = await db.query('SELECT * FROM tasks WHERE id = ?', [taskId]);
     if (task.length === 0) return res.status(404).json({ message: 'Task not found' });
 
-    await db.query('UPDATE tasks SET status = ? WHERE id = ?', [dbStatus, taskId]);
+    const workspaceId = await getWorkspaceIdForTask(taskId);
+    const role = await getMembership(workspaceId, req.user.id);
+    if (!role) return res.status(403).json({ message: 'You are not a member of this workspace' });
 
-    const [workspace] = await db.query(
-      'SELECT workspace_id FROM projects WHERE id = ?', [task[0].project_id]
-    );
+    await db.query('UPDATE tasks SET status = ? WHERE id = ?', [dbStatus, taskId]);
 
     await db.query(
       'INSERT INTO audit_logs (workspace_id, user_id, task_id, action) VALUES (?, ?, ?, ?)',
-      [workspace[0].workspace_id, req.user.id, taskId, `Moved task "${task[0].name}" to ${dbStatus}`]
+      [workspaceId, req.user.id, taskId, `Moved task "${task[0].name}" to ${dbStatus}`]
     );
 
-    req.io.to(`workspace:${workspace[0].workspace_id}`).emit('task:updated', {
-      id: parseInt(taskId),
-      status: dbStatus
-    });
+    req.io.to(`workspace:${workspaceId}`).emit('task:updated', { id: parseInt(taskId), status: dbStatus });
 
     res.json({ message: 'Task status updated' });
   } catch (err) {
@@ -160,16 +182,17 @@ exports.deleteTask = async (req, res) => {
     const [task] = await db.query('SELECT * FROM tasks WHERE id = ?', [taskId]);
     if (task.length === 0) return res.status(404).json({ message: 'Task not found' });
 
-    const [workspace] = await db.query(
-      'SELECT workspace_id FROM projects WHERE id = ?', [task[0].project_id]
-    );
+    const workspaceId = await getWorkspaceIdForTask(taskId);
+    const role = await getMembership(workspaceId, req.user.id);
+    // Deleting is more destructive than editing — require manager/admin.
+    if (!role || ROLE_RANK[role] < ROLE_RANK.manager) {
+      return res.status(403).json({ message: 'You do not have permission to delete this task' });
+    }
 
     await db.query('DELETE FROM audit_logs WHERE task_id = ?', [taskId]);
     await db.query('DELETE FROM tasks WHERE id = ?', [taskId]);
 
-    req.io.to(`workspace:${workspace[0].workspace_id}`).emit('task:deleted', {
-      id: parseInt(taskId)
-    });
+    req.io.to(`workspace:${workspaceId}`).emit('task:deleted', { id: parseInt(taskId) });
 
     res.json({ message: 'Task deleted' });
   } catch (err) {

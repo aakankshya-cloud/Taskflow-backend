@@ -24,6 +24,16 @@ const schemas = {
     deadline: Joi.string().isoDate().optional().allow(null, ''),
   }),
 
+  // NOTE: this schema didn't exist before -- updateTask had no validation at all.
+  // All fields optional since it's a partial update (PUT with COALESCE in the query).
+  updateTask: Joi.object({
+    name: Joi.string().min(1).max(120).optional(),
+    description: Joi.string().max(1000).optional().allow('', null),
+    priority: Joi.string().valid('low', 'medium', 'high').optional(),
+    deadline: Joi.string().isoDate().optional().allow(null, ''),
+    assignee_id: Joi.number().optional().allow(null),
+  }),
+
   createProject: Joi.object({
     name: Joi.string().min(1).max(150).required(),
     description: Joi.string().optional().allow('', null),
