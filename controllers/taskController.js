@@ -1,5 +1,6 @@
 const db = require('../config/db');
 const { getMembership, getWorkspaceIdForProject, getWorkspaceIdForTask, ROLE_RANK } = require('../middleware/authorize');
+const { createNotification } = require('./notificationController');
 
 exports.createTask = async (req, res) => {
   try {
@@ -46,6 +47,25 @@ exports.createTask = async (req, res) => {
 
     req.io.to(`workspace:${workspaceId}`).emit('task:created', newTask);
 
+    if (assignee_id && Number(assignee_id) !== req.user.id) {
+      // Wrapped separately: notifications are a "nice to have" side-effect.
+      // The task itself is already saved at this point — a notification
+      // failure (e.g. missing table, bad data) should never make the
+      // client think task creation failed when it actually succeeded.
+      try {
+        await createNotification({
+          userId: assignee_id,
+          workspaceId,
+          taskId: result.insertId,
+          type: 'task_assigned',
+          message: `${req.user.name} assigned you to "${name}"`,
+          io: req.io,
+        });
+      } catch (notifyErr) {
+        console.error('Failed to send task-assigned notification:', notifyErr);
+      }
+    }
+
     res.status(201).json({ message: 'Task created', id: result.insertId });
   } catch (err) {
     console.error(err);
@@ -67,18 +87,49 @@ exports.getTasks = async (req, res) => {
     const limit = Math.min(parseInt(req.query.limit) || 50, 100);
     const offset = (page - 1) * limit;
 
+    // --- Search / filter / sort ---
+    const { search, status, priority, assignee_id } = req.query;
+    const where = ['t.project_id = ?'];
+    const params = [projectId];
+
+    if (search) {
+      where.push('(t.name LIKE ? OR t.description LIKE ?)');
+      params.push(`%${search}%`, `%${search}%`);
+    }
+    if (status) {
+      where.push('t.status = ?');
+      params.push(status);
+    }
+    if (priority) {
+      where.push('t.priority = ?');
+      params.push(priority);
+    }
+    if (assignee_id) {
+      where.push('t.assignee_id = ?');
+      params.push(assignee_id);
+    }
+
+    // Whitelist sort columns/direction — never interpolate raw query params
+    // into SQL, even for ORDER BY.
+    const SORTABLE = { deadline: 't.deadline', priority: 't.priority', created_at: 't.created_at', name: 't.name' };
+    const sortBy = SORTABLE[req.query.sortBy] || 't.created_at';
+    const order = req.query.order === 'asc' ? 'ASC' : 'DESC';
+
+    const whereClause = where.join(' AND ');
+
     const [tasks] = await db.query(
       `SELECT t.*, u.name as assignee_name 
        FROM tasks t
        LEFT JOIN users u ON t.assignee_id = u.id
-       WHERE t.project_id = ?
+       WHERE ${whereClause}
+       ORDER BY ${sortBy} ${order}
        LIMIT ? OFFSET ?`,
-      [projectId, limit, offset]
+      [...params, limit, offset]
     );
 
     const [[{ total }]] = await db.query(
-      'SELECT COUNT(*) as total FROM tasks WHERE project_id = ?',
-      [projectId]
+      `SELECT COUNT(*) as total FROM tasks t WHERE ${whereClause}`,
+      params
     );
 
     res.json({ tasks, pagination: { page, limit, total, totalPages: Math.ceil(total / limit) } });
@@ -87,6 +138,7 @@ exports.getTasks = async (req, res) => {
     res.status(500).json({ message: 'Server error' });
   }
 };
+
 
 exports.updateTask = async (req, res) => {
   try {
@@ -130,12 +182,43 @@ exports.updateTask = async (req, res) => {
       assignee_id: assignee_id ?? task[0].assignee_id,
     });
 
+    await notifyIfReassigned({
+      oldAssigneeId: task[0].assignee_id,
+      newAssigneeId: assignee_id,
+      workspaceId,
+      taskId,
+      taskName: name || task[0].name,
+      actorId: req.user.id,
+      actorName: req.user.name,
+      io: req.io,
+    });
+
     res.json({ message: 'Task updated' });
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Server error' });
   }
 };
+
+async function notifyIfReassigned({ oldAssigneeId, newAssigneeId, workspaceId, taskId, taskName, actorId, actorName, io }) {
+  const changed = newAssigneeId != null && String(newAssigneeId) !== String(oldAssigneeId);
+  if (changed && Number(newAssigneeId) !== actorId) {
+    // Same reasoning as createTask: don't let a notification failure
+    // make a successful task update look like it failed.
+    try {
+      await createNotification({
+        userId: newAssigneeId,
+        workspaceId,
+        taskId,
+        type: 'task_assigned',
+        message: `${actorName} assigned you to "${taskName}"`,
+        io,
+      });
+    } catch (notifyErr) {
+      console.error('Failed to send task-reassigned notification:', notifyErr);
+    }
+  }
+}
 
 exports.updateTaskStatus = async (req, res) => {
   try {
