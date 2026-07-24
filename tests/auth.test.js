@@ -18,7 +18,7 @@ describe('Auth Endpoints', () => {
       email: `test${Date.now()}@test.com`,
       password: 'test1234',
       mode: 'create',
-      workspaceName: 'Test Workspace'
+      workspaceName: `Test Workspace ${Date.now()}-${Math.random()}`
     });
     expect(res.statusCode).toBe(201);
     expect(res.body).toHaveProperty('token');
@@ -28,10 +28,10 @@ describe('Auth Endpoints', () => {
   it('POST /api/auth/signup — should reject duplicate email', async () => {
     const email = `dup${Date.now()}@test.com`;
     await request(app).post('/api/auth/signup').send({
-      name: 'User', email, password: 'test1234', mode: 'create', workspaceName: 'WS'
+      name: 'User', email, password: 'test1234', mode: 'create', workspaceName: `WS-${Date.now()}-${Math.random()}`
     });
     const res = await request(app).post('/api/auth/signup').send({
-      name: 'User2', email, password: 'test1234', mode: 'create', workspaceName: 'WS2'
+      name: 'User2', email, password: 'test1234', mode: 'create', workspaceName: `WS2-${Date.now()}-${Math.random()}`
     });
     expect(res.statusCode).toBe(400);
     expect(res.body.message).toBe('Email already registered');
@@ -40,7 +40,7 @@ describe('Auth Endpoints', () => {
   it('POST /api/auth/login — should login successfully', async () => {
     const email = `login${Date.now()}@test.com`;
     await request(app).post('/api/auth/signup').send({
-      name: 'Login User', email, password: 'test1234', mode: 'create', workspaceName: 'WS'
+      name: 'Login User', email, password: 'test1234', mode: 'create', workspaceName: `WS-${Date.now()}-${Math.random()}`
     });
     const res = await request(app).post('/api/auth/login').send({ email, password: 'test1234' });
     expect(res.statusCode).toBe(200);
@@ -50,7 +50,7 @@ describe('Auth Endpoints', () => {
   it('POST /api/auth/login — should reject wrong password', async () => {
     const email = `wrong${Date.now()}@test.com`;
     await request(app).post('/api/auth/signup').send({
-      name: 'User', email, password: 'test1234', mode: 'create', workspaceName: 'WS'
+      name: 'User', email, password: 'test1234', mode: 'create', workspaceName: `WS-${Date.now()}-${Math.random()}`
     });
     const res = await request(app).post('/api/auth/login').send({ email, password: 'wrongpass' });
     expect(res.statusCode).toBe(401);

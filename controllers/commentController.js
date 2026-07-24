@@ -1,5 +1,21 @@
 const db = require('../config/db');
 const { getMembership, getWorkspaceIdForTask, ROLE_RANK } = require('../middleware/authorize');
+const { createNotification } = require('./notificationController');
+
+// Finds "@Full Name" mentions in a comment against the workspace's real
+// member list. Checks longest names first so "@Rhea Kapoor" doesn't get
+// mis-matched as just "@Rhea" if both exist.
+function findMentionedMembers(content, members) {
+  const sorted = [...members].sort((a, b) => b.name.length - a.name.length);
+  const matched = [];
+  const lowerContent = content.toLowerCase();
+
+  for (const member of sorted) {
+    const needle = `@${member.name}`.toLowerCase();
+    if (lowerContent.includes(needle)) matched.push(member);
+  }
+  return matched;
+}
 
 exports.getComments = async (req, res) => {
   try {
@@ -66,6 +82,33 @@ exports.addComment = async (req, res) => {
     );
 
     req.io.to(`workspace:${workspaceId}`).emit('comment:created', comment);
+
+    // --- @mentions: notify anyone tagged by name in this comment ---
+    try {
+      const [members] = await db.query(
+        `SELECT u.id, u.name FROM workspace_members wm
+         JOIN users u ON wm.user_id = u.id
+         WHERE wm.workspace_id = ?`,
+        [workspaceId]
+      );
+      const mentioned = findMentionedMembers(comment.content, members)
+        .filter((m) => m.id !== req.user.id); // don't notify yourself
+
+      for (const member of mentioned) {
+        await createNotification({
+          userId: member.id,
+          workspaceId,
+          taskId,
+          type: 'mention',
+          message: `${req.user.name} mentioned you in a comment`,
+          io: req.io,
+        });
+      }
+    } catch (mentionErr) {
+      // Mentions are a nice-to-have on top of an already-saved comment —
+      // never let this fail the request.
+      console.error('Failed to process @mentions:', mentionErr);
+    }
 
     res.status(201).json(comment);
   } catch (err) {

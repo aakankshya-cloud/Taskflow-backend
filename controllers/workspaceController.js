@@ -270,3 +270,179 @@ exports.getAnalytics = async (req, res) => {
     res.status(500).json({ message: 'Server error' });
   }
 };
+
+// --- Member management ---
+// All three behind requireWorkspaceRole('id', 'admin') in the routes file
+// except leaveWorkspace, which only needs plain membership (anyone can
+// leave a workspace they belong to).
+
+exports.changeMemberRole = async (req, res) => {
+  try {
+    const workspaceId = req.params.id;
+    const targetUserId = req.params.userId;
+    const { role } = req.body;
+
+    if (!['admin', 'manager', 'member'].includes(role)) {
+      return res.status(400).json({ message: 'Invalid role' });
+    }
+
+    const [target] = await db.query(
+      'SELECT role FROM workspace_members WHERE workspace_id = ? AND user_id = ?',
+      [workspaceId, targetUserId]
+    );
+    if (target.length === 0) return res.status(404).json({ message: 'Member not found' });
+
+    // If we're demoting the last remaining admin, block it — otherwise
+    // the workspace could end up with zero admins and nobody able to
+    // manage it.
+    if (target[0].role === 'admin' && role !== 'admin') {
+      const [[{ adminCount }]] = await db.query(
+        `SELECT COUNT(*) as adminCount FROM workspace_members WHERE workspace_id = ? AND role = 'admin'`,
+        [workspaceId]
+      );
+      if (adminCount <= 1) {
+        return res.status(400).json({ message: 'A workspace must have at least one admin' });
+      }
+    }
+
+    await db.query(
+      'UPDATE workspace_members SET role = ? WHERE workspace_id = ? AND user_id = ?',
+      [role, workspaceId, targetUserId]
+    );
+
+    await db.query(
+      'INSERT INTO audit_logs (workspace_id, user_id, action) VALUES (?, ?, ?)',
+      [workspaceId, req.user.id, `Changed a member's role to ${role}`]
+    );
+
+    res.json({ message: 'Role updated' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+exports.removeMember = async (req, res) => {
+  try {
+    const workspaceId = req.params.id;
+    const targetUserId = req.params.userId;
+
+    if (String(targetUserId) === String(req.user.id)) {
+      return res.status(400).json({ message: 'Use "Leave workspace" to remove yourself' });
+    }
+
+    const [target] = await db.query(
+      'SELECT role FROM workspace_members WHERE workspace_id = ? AND user_id = ?',
+      [workspaceId, targetUserId]
+    );
+    if (target.length === 0) return res.status(404).json({ message: 'Member not found' });
+
+    if (target[0].role === 'admin') {
+      const [[{ adminCount }]] = await db.query(
+        `SELECT COUNT(*) as adminCount FROM workspace_members WHERE workspace_id = ? AND role = 'admin'`,
+        [workspaceId]
+      );
+      if (adminCount <= 1) {
+        return res.status(400).json({ message: 'A workspace must have at least one admin — promote someone else first' });
+      }
+    }
+
+    await db.query(
+      'DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?',
+      [workspaceId, targetUserId]
+    );
+
+    // Unassign (don't delete) their tasks so work isn't silently lost.
+    await db.query(
+      `UPDATE tasks t JOIN projects p ON t.project_id = p.id
+       SET t.assignee_id = NULL
+       WHERE p.workspace_id = ? AND t.assignee_id = ?`,
+      [workspaceId, targetUserId]
+    );
+
+    await db.query(
+      'INSERT INTO audit_logs (workspace_id, user_id, action) VALUES (?, ?, ?)',
+      [workspaceId, req.user.id, 'Removed a member from the workspace']
+    );
+
+    res.json({ message: 'Member removed' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+exports.leaveWorkspace = async (req, res) => {
+  try {
+    const workspaceId = req.params.id;
+
+    const [self] = await db.query(
+      'SELECT role FROM workspace_members WHERE workspace_id = ? AND user_id = ?',
+      [workspaceId, req.user.id]
+    );
+    if (self.length === 0) return res.status(404).json({ message: 'You are not a member of this workspace' });
+
+    if (self[0].role === 'admin') {
+      const [[{ adminCount }]] = await db.query(
+        `SELECT COUNT(*) as adminCount FROM workspace_members WHERE workspace_id = ? AND role = 'admin'`,
+        [workspaceId]
+      );
+      if (adminCount <= 1) {
+        return res.status(400).json({ message: 'Promote another admin before leaving — a workspace can\'t have zero admins' });
+      }
+    }
+
+    await db.query(
+      'DELETE FROM workspace_members WHERE workspace_id = ? AND user_id = ?',
+      [workspaceId, req.user.id]
+    );
+
+    await db.query(
+      `UPDATE tasks t JOIN projects p ON t.project_id = p.id
+       SET t.assignee_id = NULL
+       WHERE p.workspace_id = ? AND t.assignee_id = ?`,
+      [workspaceId, req.user.id]
+    );
+
+    res.json({ message: 'You have left the workspace' });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
+
+// --- Global search within a workspace ---
+// Searches across projects and tasks in one workspace at once, instead of
+// having to search one project's task list at a time.
+exports.search = async (req, res) => {
+  try {
+    const workspaceId = req.params.id;
+    const q = (req.query.q || '').trim();
+
+    if (!q) return res.json({ projects: [], tasks: [] });
+    if (q.length > 100) return res.status(400).json({ message: 'Search term too long' });
+
+    const like = `%${q}%`;
+
+    const [projects] = await db.query(
+      `SELECT id, name, description, status FROM projects
+       WHERE workspace_id = ? AND (name LIKE ? OR description LIKE ?)
+       LIMIT 10`,
+      [workspaceId, like, like]
+    );
+
+    const [tasks] = await db.query(
+      `SELECT t.id, t.name, t.status, t.priority, t.project_id, p.name as project_name
+       FROM tasks t
+       JOIN projects p ON t.project_id = p.id
+       WHERE p.workspace_id = ? AND (t.name LIKE ? OR t.description LIKE ?)
+       LIMIT 20`,
+      [workspaceId, like, like]
+    );
+
+    res.json({ projects, tasks });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Server error' });
+  }
+};
