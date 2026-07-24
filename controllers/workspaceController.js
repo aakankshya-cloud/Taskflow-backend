@@ -174,16 +174,25 @@ function scoreForTask(task) {
   const priorityWeight = PRIORITY_WEIGHT[task.priority] || PRIORITY_WEIGHT.medium;
   let urgencyWeight = 1;
   if (task.deadline) {
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    const due = new Date(task.deadline);
-    const daysUntilDue = Math.ceil((due - today) / (1000 * 60 * 60 * 24));
+    // Compare calendar dates, not exact timestamps. Diffing "now" against
+    // a deadline directly is sensitive to what time of day it currently
+    // is — e.g. a task due "yesterday" could still come out as "0 days
+    // overdue" if less than 24 exact hours have passed. Normalizing both
+    // sides to local midnight makes this an exact day count instead.
+    const now = new Date();
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+
+    const dueRaw = new Date(task.deadline);
+    const due = new Date(dueRaw.getFullYear(), dueRaw.getMonth(), dueRaw.getDate());
+
+    const daysUntilDue = Math.round((due - today) / (1000 * 60 * 60 * 24));
     if (daysUntilDue < 0) urgencyWeight = 3;
     else if (daysUntilDue <= 3) urgencyWeight = 2;
     else urgencyWeight = 1;
   }
   return priorityWeight * urgencyWeight;
 }
+exports.scoreForTask = scoreForTask; // exported so Workload.test.js can unit-test the scoring math directly
 
 // Behind requireWorkspaceRole('id', 'member')
 exports.getWorkload = async (req, res) => {

@@ -77,7 +77,7 @@ describe('GET /api/workspaces/:id/workload (integration)', () => {
       email,
       password: 'test1234',
       mode: 'create',
-      workspaceName: 'Workload WS',
+      workspaceName: `Workload WS ${Date.now()}`,
     });
     token = signup.body.token;
     userId = signup.body.user.id;

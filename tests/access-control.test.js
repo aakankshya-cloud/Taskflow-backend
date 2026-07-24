@@ -71,7 +71,7 @@ describe('Access control on workspace-scoped routes', () => {
     const inviteRes = await request(app)
       .post(`/api/workspaces/${workspaceId}/invite`)
       .set('Authorization', `Bearer ${owner.token}`)
-      .send({ email: null, role: 'member' });
+      .send({ email: attacker.user.email, role: 'member' });
     const code = inviteRes.body.code;
 
     // attacker tries to join AS the victim by spoofing userId
