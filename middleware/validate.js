@@ -5,9 +5,9 @@ const schemas = {
     name: Joi.string().min(2).max(100).required(),
     email: Joi.string().email().required(),
     password: Joi.string().min(6).required(),
-    workspaceName: Joi.string().min(2).max(150).optional(),
-    mode: Joi.string().valid('create', 'join').optional(),
-    inviteCode: Joi.string().optional(),
+    workspaceName: Joi.string().min(2).max(150).allow('', null).optional(),
+mode: Joi.string().valid('create', 'join').optional(),
+inviteCode: Joi.string().allow('', null).optional(),
   }),
 
   login: Joi.object({
