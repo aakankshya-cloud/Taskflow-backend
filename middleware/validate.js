@@ -5,14 +5,30 @@ const schemas = {
     name: Joi.string().min(2).max(100).required(),
     email: Joi.string().email().required(),
     password: Joi.string().min(6).required(),
+    // .allow('', null) matters here: the signup form always submits both
+    // workspaceName and inviteCode together regardless of which mode is
+    // selected, so the one that's irrelevant for the chosen mode arrives
+    // as an empty string rather than being omitted. Joi's .optional()
+    // alone only permits a field to be *missing*, not empty — so without
+    // this, "create workspace" signups failed with
+    // '"inviteCode" is not allowed to be empty'.
     workspaceName: Joi.string().min(2).max(150).allow('', null).optional(),
-mode: Joi.string().valid('create', 'join').optional(),
-inviteCode: Joi.string().allow('', null).optional(),
+    mode: Joi.string().valid('create', 'join').optional(),
+    inviteCode: Joi.string().allow('', null).optional(),
   }),
 
   login: Joi.object({
     email: Joi.string().email().required(),
     password: Joi.string().required(),
+  }),
+
+  forgotPassword: Joi.object({
+    email: Joi.string().email().required(),
+  }),
+
+  resetPassword: Joi.object({
+    token: Joi.string().required(),
+    password: Joi.string().min(8).required(),
   }),
 
   createTask: Joi.object({
