@@ -15,7 +15,9 @@ const commentRoutes = require('./routes/commentRoutes');
 const notificationRoutes = require('./routes/notificationRoutes');
 const swaggerUi = require('swagger-ui-express');
 const swaggerSpec = require('./swagger');
-
+const chatRoutes = require('./routes/chatRoutes');
+const messageRoutes = require('./routes/messageRoutes');
+const dmRoutes = require('./routes/dmRoutes');
 const app = express();
 const server = http.createServer(app);
 
@@ -99,7 +101,9 @@ app.use('/api/projects', projectRoutes);
 app.use('/api/tasks', taskRoutes);
 app.use('/api/tasks', commentRoutes);
 app.use('/api/notifications', notificationRoutes);
-
+app.use('/api/chat', chatRoutes);
+app.use('/api/messages', messageRoutes);
+app.use('/api/dms', dmRoutes);
 const PORT = process.env.PORT || 5000;
 
 const originalListen = server.listen.bind(server);
